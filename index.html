@@ -893,13 +893,15 @@ html:not(.locked) #noaccess{display:none!important}
       <label class="sync-lb" style="margin-top:22px">③ 云同步（自动，无需来回复制）</label>
       <div style="background:#f6f9fd;border:1px solid var(--line);border-radius:10px;padding:12px 14px">
         <div id="cloudState" style="font-size:12.5px;color:#3a4658;line-height:1.8;margin-bottom:10px">状态：未配置</div>
+        <div id="cloudErr" style="display:none;background:#fdecea;border:1px solid #f3b6b0;color:#a4241a;border-radius:9px;padding:10px 12px;font-size:12.5px;line-height:1.85;margin-bottom:10px;white-space:pre-line;word-break:break-word"></div>
 
         <div id="cloudSetup">
           <input class="inp" id="cloudToken" type="password" autocomplete="off" spellcheck="false"
-                 placeholder="粘贴 GitHub 令牌（只需勾选 gist 权限）"
+                 placeholder="粘贴 GitHub 令牌（必须 classic，勾选 gist）"
                  style="width:100%;box-sizing:border-box;font-size:16px">
           <div class="sync-row" style="margin-top:9px">
             <button class="btn primary" id="cloudConnect">连接并启用</button>
+            <button class="btn" id="cloudCheck">检查令牌</button>
           </div>
         </div>
 
@@ -913,7 +915,8 @@ html:not(.locked) #noaccess{display:none!important}
 
         <p class="sync-tip" style="margin-top:10px">
           开启后：改动会自动上传，打开页面时自动拉取，手机和电脑不用再手动复制同步包。<br>
-          数据在本机用<b>访问密钥加密</b>后才上传，存进<b>你自己的私有 Gist</b>（别人打不开）。令牌只存在这台设备的浏览器里，不上传给任何第三方。
+          数据在本机用<b>访问密钥加密</b>后才上传，存进<b>你自己的私有 Gist</b>（别人打不开）。令牌只存在这台设备的浏览器里，不上传给任何第三方。<br>
+          <b style="color:#b3261e">令牌要求：</b>类型选 <b>Tokens (classic)</b>，权限只勾 <b>gist</b>；只勾 repo 会失败（GitHub 对无 gist 权限的请求返回 404）。细粒度令牌（github_pat_…）不支持 Gist。
         </p>
       </div>
     </div>
@@ -2662,6 +2665,7 @@ function bindEvents(){
     renderCloudPanel();
   });
   document.getElementById('cloudConnect').addEventListener('click', cloudConnectUI);
+  document.getElementById('cloudCheck').addEventListener('click', cloudCheckUI);
   document.getElementById('cloudSyncNow').addEventListener('click', cloudSyncNow);
   document.getElementById('cloudPullNow').addEventListener('click', cloudTakeRemote);
   document.getElementById('cloudOff').addEventListener('click', cloudDisconnect);
@@ -2978,8 +2982,43 @@ function cloudApi(method, path, body, token){
   return fetch('https://api.github.com' + path, opt).then(function(r){
     return r.text().then(function(t){
       var j = null; try { j = t ? JSON.parse(t) : {}; } catch(e){ j = {}; }
-      if (!r.ok) throw new Error((j && j.message) ? j.message : ('GitHub 返回 ' + r.status));
+      if (!r.ok) throw new Error(cloudApiMsg(r.status, path, j));
       return j;
+    });
+  });
+}
+
+/* 把 GitHub 的状态码翻译成人能看懂的话（GitHub 对“无权限”一律回 404，最容易误解） */
+function cloudApiMsg(status, path, j){
+  var raw = (j && j.message) ? j.message : '';
+  var isGist = /^\/gists/.test(String(path || ''));
+  if (status === 401) return '令牌无效或已过期，请重新生成（GitHub 返回 401）';
+  if (status === 403) return '令牌被拒绝或触发频率限制，请稍后重试（GitHub 返回 403）' + (raw ? '：' + raw : '');
+  if (status === 404){
+    if (isGist) return '令牌缺少 gist 权限。GitHub 对无 gist 权限的令牌返回 404（不是“找不到文件”）\n处理：重新生成 classic 令牌，权限只勾 gist';
+    return '云端存储区不存在，可能已被删除（GitHub 返回 404）';
+  }
+  if (status === 422) return '提交的数据 GitHub 不接受（422）' + (raw ? '：' + raw : '');
+  return raw || ('GitHub 返回 ' + status);
+}
+
+/* 读令牌的权限范围：GitHub 在响应头 X-OAuth-Scopes 里返回，浏览器可读 */
+function cloudCheckToken(token){
+  var opt = {
+    headers: {
+      Authorization: 'Bearer ' + token,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    }
+  };
+  return fetch('https://api.github.com/user', opt).then(function(r){
+    if (r.status === 401) throw new Error('令牌无效或已过期，请重新生成');
+    var raw = (r.headers && r.headers.get) ? (r.headers.get('x-oauth-scopes') || '') : '';
+    var scopes = raw.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+    return r.text().then(function(t){
+      var login = '';
+      try { login = (JSON.parse(t) || {}).login || ''; } catch(e){}
+      return { scopes: scopes, raw: raw, login: login, hasGist: scopes.indexOf('gist') >= 0 };
     });
   });
 }
@@ -2988,7 +3027,15 @@ function cloudApi(method, path, body, token){
 function cloudConnect(token){
   token = String(token || '').trim();
   if (!token) return Promise.reject(new Error('请先粘贴令牌'));
-  return cloudApi('GET', '/gists?per_page=100', null, token).then(function(list){
+  if (/^github_pat_/.test(token))
+    return Promise.reject(new Error('这是细粒度令牌（github_pat_…），Gist 接口不支持。\n请改用 Tokens (classic)，只勾 gist'));
+  return cloudCheckToken(token).then(function(info){
+    if (info.scopes.indexOf('gist') < 0){
+      var got = info.scopes.length ? info.scopes.join('、') : '无任何权限';
+      return Promise.reject(new Error('令牌缺少 gist 权限（当前只有：' + got + '）。\n请重新生成 classic 令牌，只勾 gist —— 只勾 repo 不够，GitHub 会返回 404'));
+    }
+    return cloudApi('GET', '/gists?per_page=100', null, token);
+  }).then(function(list){
     var found = null;
     (Array.isArray(list) ? list : []).forEach(function(g){
       if (g && g.description === CLOUD_TAG && !found) found = g;
@@ -3059,11 +3106,13 @@ function cloudSyncNow(){
       if (r.updated) parts.push('更新 ' + r.updated + ' 条');
       if (r.mAdded) parts.push('素材 +' + r.mAdded);
       renderCloudPanel();
+      clearCloudErr();
       toast(parts.length ? ('同步完成：' + parts.join('，')) : '两边已一致');
     });
   }).catch(function(err){
-    setCloudState('同步失败');
-    toast('云同步失败：' + (err && err.message ? err.message : '未知错误'));
+    setCloudState('同步失败 · 未上传');
+    setCloudErr('云同步失败：' + cloudErrMsg(err));
+    toast('云同步失败，原因见红框');
   }).then(function(){ cloudBusy = false; });
 }
 
@@ -3082,18 +3131,35 @@ function cloudTakeRemote(){
       saveState(true);
       refreshAll();
       renderCloudPanel();
+      clearCloudErr();
       toast('已用云端数据覆盖本机');
     }).catch(function(err){
       setCloudState('拉取失败');
-      toast('拉取失败：' + (err && err.message ? err.message : '未知错误'));
+      setCloudErr('拉取失败：' + cloudErrMsg(err));
+      toast('拉取失败，原因见红框');
     });
   });
 }
+
+function cloudErrMsg(err){
+  var m = (err && err.message) ? err.message : '未知错误';
+  if (/Failed to fetch|NetworkError|network/i.test(m))
+    return '网络请求失败：连不上 api.github.com。请检查网络，或稍后重试';
+  return m;
+}
+function setCloudErr(msg){
+  var el = document.getElementById('cloudErr');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.style.display = msg ? '' : 'none';
+}
+function clearCloudErr(){ setCloudErr(''); }
 
 function cloudConnectUI(){
   var inp = document.getElementById('cloudToken');
   var token = inp ? String(inp.value || '').trim() : '';
   if (!token){ toast('请先粘贴 GitHub 令牌'); return; }
+  clearCloudErr();
   setCloudState('连接中…');
   cloudConnect(token).then(function(cfg){
     saveCloudCfg(cfg);
@@ -3102,8 +3168,45 @@ function cloudConnectUI(){
     toast('已连接，开始同步…');
     cloudSyncNow();
   }).catch(function(err){
-    setCloudState('连接失败');
-    toast('连接失败：' + (err && err.message ? err.message : '未知错误'));
+    setCloudState('连接失败 · 未生效');
+    setCloudErr('连接失败：' + cloudErrMsg(err) +
+      '\n\n怎么修：github.com/settings/tokens → Generate new token (classic) → 只勾 gist → 生成后复制整串（ghp_ 开头）重新粘贴。');
+    toast('连接失败，原因见上方红框');
+  });
+}
+
+/* 检查令牌：不建 Gist，只验证有效性 + 权限 + 能否读写 */
+function cloudCheckUI(){
+  var inp = document.getElementById('cloudToken');
+  var token = inp ? String(inp.value || '').trim() : '';
+  var cfg = loadCloudCfg();
+  if (!token && cfg && cfg.token) token = cfg.token;
+  if (!token){ toast('请先粘贴 GitHub 令牌'); return; }
+  clearCloudErr();
+  setCloudState('检查中…');
+  cloudCheckToken(token).then(function(info){
+    if (!info.hasGist){
+      var got = info.scopes.length ? info.scopes.join('、') : '无任何权限';
+      setCloudState('权限不足');
+      setCloudErr('令牌能用，但权限不对。\n当前权限：' + got + '　需要：gist\n' +
+        (info.scopes.indexOf('repo') >= 0
+          ? '你勾的是 repo —— 这个权限不包含 Gist，GitHub 对它的 gist 请求直接返回 404，所以连接静默失败。\n'
+          : '') +
+        '\n修法：github.com/settings/tokens → Generate new token (classic) → 只勾 gist → 生成后复制（ghp_ 开头）重新粘贴。');
+      return;
+    }
+    return cloudApi('GET', '/gists?per_page=100', null, token).then(function(list){
+      var n = Array.isArray(list) ? list.length : 0;
+      var found = null;
+      (Array.isArray(list) ? list : []).forEach(function(g){
+        if (g && g.description === CLOUD_TAG && !found) found = g;
+      });
+      setCloudState('令牌正常' + (info.login ? ' · 账号 ' + info.login : '') + ' · 可读写 Gist');
+      toast('令牌正常：权限 ' + info.scopes.join('、') + '，已有 Gist ' + n + ' 个' + (found ? '，已找到工作台存储区' : ''));
+    });
+  }).catch(function(err){
+    setCloudState('检查失败');
+    setCloudErr('检查失败：' + cloudErrMsg(err));
   });
 }
 
@@ -3146,7 +3249,11 @@ function scheduleCloudPush(){
   if (!loadCloudCfg()) return;
   if (cloudPushTimer) clearTimeout(cloudPushTimer);
   cloudPushTimer = setTimeout(function(){
-    cloudPush(true).then(function(){ renderCloudPanel(); }).catch(function(){});
+    cloudPush(true).then(function(){ clearCloudErr(); renderCloudPanel(); }).catch(function(err){
+      // 后台自动上传失败必须留痕，否则用户只看到“已连接”却永远同步不上
+      setCloudErr('自动上传失败：' + cloudErrMsg(err));
+      setCloudState('自动同步失败');
+    });
   }, 2500);
 }
 
@@ -3162,8 +3269,13 @@ function cloudAutoPull(){
       toast('已从云端同步 ' + ((r.added || 0) + (r.updated || 0)) + ' 条更新');
     }
     return cloudPush(true);
-  }).catch(function(){/* 静默失败，不影响本地使用 */})
-   .then(function(){ cloudBusy = false; });
+  }).then(function(){
+    clearCloudErr();
+  }).catch(function(err){
+    // 打开页面时的自动同步失败：不打断使用，但要在面板里留痕
+    setCloudErr('自动同步失败：' + cloudErrMsg(err));
+    setCloudState('自动同步失败');
+  }).then(function(){ cloudBusy = false; });
 }
 
 /* =========================================================
