@@ -889,6 +889,33 @@ html:not(.locked) #noaccess{display:none!important}
       <textarea class="inp sync-ta" id="syncIn" placeholder="把另一台设备生成的同步包整段粘贴到这里"></textarea>
       <button class="btn primary" id="syncMerge" style="width:100%;margin-top:9px">合并导入</button>
       <p class="sync-tip">同步包做了压缩，通常几 KB 到几十 KB。内容只包含工作台账、指标和素材文字。</p>
+
+      <label class="sync-lb" style="margin-top:22px">③ 云同步（自动，无需来回复制）</label>
+      <div style="background:#f6f9fd;border:1px solid var(--line);border-radius:10px;padding:12px 14px">
+        <div id="cloudState" style="font-size:12.5px;color:#3a4658;line-height:1.8;margin-bottom:10px">状态：未配置</div>
+
+        <div id="cloudSetup">
+          <input class="inp" id="cloudToken" type="password" autocomplete="off" spellcheck="false"
+                 placeholder="粘贴 GitHub 令牌（只需勾选 gist 权限）"
+                 style="width:100%;box-sizing:border-box;font-size:16px">
+          <div class="sync-row" style="margin-top:9px">
+            <button class="btn primary" id="cloudConnect">连接并启用</button>
+          </div>
+        </div>
+
+        <div id="cloudOn" style="display:none">
+          <div class="sync-row">
+            <button class="btn primary" id="cloudSyncNow">立即同步</button>
+            <button class="btn" id="cloudPullNow">以云端为准</button>
+            <button class="btn" id="cloudOff">断开</button>
+          </div>
+        </div>
+
+        <p class="sync-tip" style="margin-top:10px">
+          开启后：改动会自动上传，打开页面时自动拉取，手机和电脑不用再手动复制同步包。<br>
+          数据在本机用<b>访问密钥加密</b>后才上传，存进<b>你自己的私有 Gist</b>（别人打不开）。令牌只存在这台设备的浏览器里，不上传给任何第三方。
+        </p>
+      </div>
     </div>
     <div class="modal-f">
       <button class="btn" data-close="syncMask">关闭</button>
@@ -1076,7 +1103,7 @@ function saveState(silent){
   try {
     state.updatedAt = new Date().toISOString();
     localStorage.setItem(KEY, JSON.stringify(state));
-    if (!silent) setSyncOk();
+    if (!silent){ setSyncOk(); scheduleCloudPush(); }
   } catch(e){
     setSyncErr();
   }
@@ -2632,7 +2659,12 @@ function bindEvents(){
   document.getElementById('btnLink').addEventListener('click', showPrivateLink);
   document.getElementById('btnSync').addEventListener('click', function(){
     document.getElementById('syncMask').classList.add('on');
+    renderCloudPanel();
   });
+  document.getElementById('cloudConnect').addEventListener('click', cloudConnectUI);
+  document.getElementById('cloudSyncNow').addEventListener('click', cloudSyncNow);
+  document.getElementById('cloudPullNow').addEventListener('click', cloudTakeRemote);
+  document.getElementById('cloudOff').addEventListener('click', cloudDisconnect);
   document.getElementById('syncGen').addEventListener('click', doSyncGen);
   document.getElementById('syncMerge').addEventListener('click', doSyncMerge);
   document.getElementById('syncCopy').addEventListener('click', function(){
@@ -2862,6 +2894,279 @@ function fallbackCopy(txt){
 }
 
 /* =========================================================
+   7.5 云同步：本机加密 → 存入你自己的 GitHub 私有 Gist
+   零第三方服务，只用 GitHub 官方 API
+   ========================================================= */
+var CLOUD_STORE = 'wb_xkjs_cloud_v1';
+var CLOUD_TAG   = 'xkjs-workbench-sync';
+var CLOUD_FILE  = 'xkjs.json';
+var CLOUD_SALT  = 'xkjs-cloud-salt-2026';
+var cloudPushTimer = null;
+var cloudBusy = false;
+
+function loadCloudCfg(){
+  try {
+    var raw = localStorage.getItem(CLOUD_STORE);
+    if (!raw) return null;
+    var o = JSON.parse(raw);
+    if (!o || !o.token || !o.gistId) return null;
+    return o;
+  } catch(e){ return null; }
+}
+function saveCloudCfg(o){ try { localStorage.setItem(CLOUD_STORE, JSON.stringify(o)); } catch(e){} }
+function clearCloudCfg(){ try { localStorage.removeItem(CLOUD_STORE); } catch(e){} }
+
+function cloudHasCrypto(){ return !!(window.crypto && window.crypto.subtle && window.crypto.subtle.deriveKey); }
+function cloudPassphrase(){
+  var k = '';
+  try { k = localStorage.getItem('wb_xkjs_key_v1') || ''; } catch(e){ k = ''; }
+  if (!k && location.protocol === 'file:') k = '__local__';
+  return k || 'xkjs-default';
+}
+function cloudDerive(){
+  var enc = new TextEncoder();
+  return crypto.subtle.importKey('raw', enc.encode(cloudPassphrase()), 'PBKDF2', false, ['deriveKey'])
+    .then(function(km){
+      return crypto.subtle.deriveKey(
+        { name:'PBKDF2', salt: enc.encode(CLOUD_SALT), iterations: 100000, hash:'SHA-256' },
+        km, { name:'AES-GCM', length:256 }, false, ['encrypt','decrypt']);
+    });
+}
+function cloudPlainWrap(s){ return 'PLAIN1:' + btoa(unescape(encodeURIComponent(s))); }
+function cloudPlainUnwrap(s){ return decodeURIComponent(escape(atob(s.slice(7)))); }
+
+function cloudEncrypt(plain){
+  if (!cloudHasCrypto()) return Promise.resolve(cloudPlainWrap(plain));
+  var iv = crypto.getRandomValues(new Uint8Array(12));
+  var enc = new TextEncoder();
+  return cloudDerive().then(function(ak){
+    return crypto.subtle.encrypt({ name:'AES-GCM', iv: iv }, ak, enc.encode(plain));
+  }).then(function(ct){
+    return 'GCM1:' + bytesToB64(iv) + ':' + bytesToB64(new Uint8Array(ct));
+  }).catch(function(){ return cloudPlainWrap(plain); });
+}
+function cloudDecrypt(s){
+  s = String(s || '');
+  if (s.indexOf('GCM1:') === 0){
+    var p = s.split(':');
+    if (p.length < 3) return Promise.reject(new Error('云端数据格式异常'));
+    if (!cloudHasCrypto()) return Promise.reject(new Error('当前环境不支持解密，请用 https 打开'));
+    return cloudDerive().then(function(ak){
+      return crypto.subtle.decrypt({ name:'AES-GCM', iv: b64ToBytes(p[1]) }, ak, b64ToBytes(p[2]));
+    }).then(function(buf){ return new TextDecoder().decode(new Uint8Array(buf)); })
+      .catch(function(){ throw new Error('解密失败：本机访问密钥与上传时不一致'); });
+  }
+  if (s.indexOf('PLAIN1:') === 0){
+    try { return Promise.resolve(cloudPlainUnwrap(s)); }
+    catch(e){ return Promise.reject(new Error('云端数据已损坏')); }
+  }
+  return Promise.resolve(s);
+}
+
+function cloudApi(method, path, body, token){
+  var cfg = loadCloudCfg();
+  var tk = token || (cfg && cfg.token) || '';
+  var opt = {
+    method: method,
+    headers: {
+      Authorization: 'Bearer ' + tk,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    }
+  };
+  if (body){ opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  return fetch('https://api.github.com' + path, opt).then(function(r){
+    return r.text().then(function(t){
+      var j = null; try { j = t ? JSON.parse(t) : {}; } catch(e){ j = {}; }
+      if (!r.ok) throw new Error((j && j.message) ? j.message : ('GitHub 返回 ' + r.status));
+      return j;
+    });
+  });
+}
+
+/* 连接：用令牌找到（或新建）专属的私有 Gist */
+function cloudConnect(token){
+  token = String(token || '').trim();
+  if (!token) return Promise.reject(new Error('请先粘贴令牌'));
+  return cloudApi('GET', '/gists?per_page=100', null, token).then(function(list){
+    var found = null;
+    (Array.isArray(list) ? list : []).forEach(function(g){
+      if (g && g.description === CLOUD_TAG && !found) found = g;
+    });
+    if (found) return { token: token, gistId: found.id, lastSync: '' };
+    var f = {}; f[CLOUD_FILE] = { content: '{}' };
+    return cloudApi('POST', '/gists', { description: CLOUD_TAG, public: false, files: f }, token)
+      .then(function(g){ return { token: token, gistId: g.id, lastSync: '' }; });
+  });
+}
+
+function cloudPayload(){
+  return {
+    app: 'xkjs', v: 2,
+    at: new Date().toISOString(),
+    items: state.items || [],
+    materials: state.materials || [],
+    metrics: state.metrics || {}
+  };
+}
+
+function cloudPush(silent){
+  var c = loadCloudCfg();
+  if (!c) return Promise.reject(new Error('未配置云同步'));
+  return cloudEncrypt(JSON.stringify(cloudPayload())).then(function(enc){
+    if (enc.length > 900000) throw new Error('数据超过 900KB，Gist 会被截断。请先清理素材再同步');
+    var f = {}; f[CLOUD_FILE] = { content: enc };
+    return cloudApi('PATCH', '/gists/' + c.gistId, { files: f });
+  }).then(function(){
+    c.lastSync = new Date().toISOString();
+    saveCloudCfg(c);
+    if (!silent) toast('已上传到云端');
+    return true;
+  });
+}
+
+function cloudPull(){
+  var c = loadCloudCfg();
+  if (!c) return Promise.reject(new Error('未配置云同步'));
+  return cloudApi('GET', '/gists/' + c.gistId).then(function(g){
+    var files = g.files || {};
+    var f = files[CLOUD_FILE] || files[Object.keys(files)[0]];
+    if (!f) throw new Error('云端还没有数据');
+    if (f.truncated) throw new Error('云端数据过大被截断，请清理素材后重新上传');
+    return cloudDecrypt(f.content);
+  }).then(function(txt){
+    var obj = JSON.parse(txt);
+    if (!obj || typeof obj !== 'object') throw new Error('云端数据格式不对');
+    // 刚建好的存储区还是空的，视为“云端无数据”，交给调用方去首次上传
+    if (!Array.isArray(obj.items)) return null;
+    return obj;
+  });
+}
+
+/* 双向同步：先合并云端到本地，再把合并结果传回云端 */
+function cloudSyncNow(){
+  if (cloudBusy) return;
+  if (!loadCloudCfg()){ toast('还没配置云同步'); return; }
+  cloudBusy = true;
+  setCloudState('同步中…');
+  cloudPull().then(function(obj){
+    var r = obj ? mergeSyncPack(obj) : { added: 0, updated: 0, mAdded: 0, metricsTaken: false };
+    saveState(true);
+    refreshAll();
+    return cloudPush(true).then(function(){
+      var parts = [];
+      if (r.added) parts.push('新增 ' + r.added + ' 条');
+      if (r.updated) parts.push('更新 ' + r.updated + ' 条');
+      if (r.mAdded) parts.push('素材 +' + r.mAdded);
+      renderCloudPanel();
+      toast(parts.length ? ('同步完成：' + parts.join('，')) : '两边已一致');
+    });
+  }).catch(function(err){
+    setCloudState('同步失败');
+    toast('云同步失败：' + (err && err.message ? err.message : '未知错误'));
+  }).then(function(){ cloudBusy = false; });
+}
+
+/* 以云端为准：整体覆盖本机 */
+function cloudTakeRemote(){
+  if (!loadCloudCfg()){ toast('还没配置云同步'); return; }
+  askConfirm('以云端为准', '将用云端数据<b>覆盖本机</b>的事项、素材与指标，本机尚未上传的改动会丢失。', function(){
+    setCloudState('拉取中…');
+    cloudPull().then(function(obj){
+      if (!obj){ setCloudState('云端为空'); toast('云端还没有数据，请先点「立即同步」上传一次'); return; }
+      var items = [];
+      (obj.items || []).forEach(function(raw){ var it = normalizeItem(raw); if (it) items.push(it); });
+      state.items = items;
+      state.materials = Array.isArray(obj.materials) ? obj.materials : [];
+      if (obj.metrics) state.metrics = Object.assign({}, state.metrics, obj.metrics);
+      saveState(true);
+      refreshAll();
+      renderCloudPanel();
+      toast('已用云端数据覆盖本机');
+    }).catch(function(err){
+      setCloudState('拉取失败');
+      toast('拉取失败：' + (err && err.message ? err.message : '未知错误'));
+    });
+  });
+}
+
+function cloudConnectUI(){
+  var inp = document.getElementById('cloudToken');
+  var token = inp ? String(inp.value || '').trim() : '';
+  if (!token){ toast('请先粘贴 GitHub 令牌'); return; }
+  setCloudState('连接中…');
+  cloudConnect(token).then(function(cfg){
+    saveCloudCfg(cfg);
+    if (inp) inp.value = '';
+    renderCloudPanel();
+    toast('已连接，开始同步…');
+    cloudSyncNow();
+  }).catch(function(err){
+    setCloudState('连接失败');
+    toast('连接失败：' + (err && err.message ? err.message : '未知错误'));
+  });
+}
+
+function cloudDisconnect(){
+  askConfirm('断开云同步', '本机停止自动同步。云端数据<b>不会删除</b>，用同一令牌重新连接即可恢复。', function(){
+    clearCloudCfg();
+    renderCloudPanel();
+    toast('已断开云同步');
+  });
+}
+
+function fmtCloudTime(iso){
+  try {
+    var d = new Date(iso);
+    return (d.getMonth()+1) + '月' + d.getDate() + '日 ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  } catch(e){ return ''; }
+}
+function setCloudState(txt){
+  var el = document.getElementById('cloudState');
+  if (el) el.textContent = '状态：' + txt;
+}
+function renderCloudPanel(){
+  var c = loadCloudCfg();
+  var setup = document.getElementById('cloudSetup');
+  var on = document.getElementById('cloudOn');
+  if (c){
+    if (setup) setup.style.display = 'none';
+    if (on) on.style.display = '';
+    setCloudState('已连接 · 存储区 …' + String(c.gistId).slice(-6) +
+      (c.lastSync ? ' · 上次同步 ' + fmtCloudTime(c.lastSync) : ' · 尚未同步'));
+  } else {
+    if (setup) setup.style.display = '';
+    if (on) on.style.display = 'none';
+    setCloudState('未配置');
+  }
+}
+
+/* 改动后 2.5 秒节流上传 */
+function scheduleCloudPush(){
+  if (!loadCloudCfg()) return;
+  if (cloudPushTimer) clearTimeout(cloudPushTimer);
+  cloudPushTimer = setTimeout(function(){
+    cloudPush(true).then(function(){ renderCloudPanel(); }).catch(function(){});
+  }, 2500);
+}
+
+/* 打开页面时自动拉取一次 */
+function cloudAutoPull(){
+  if (!loadCloudCfg() || cloudBusy) return;
+  cloudBusy = true;
+  cloudPull().then(function(obj){
+    var r = obj ? mergeSyncPack(obj) : { added: 0, updated: 0, mAdded: 0, metricsTaken: false };
+    if (r.added || r.updated || r.mAdded || r.metricsTaken){
+      saveState(true);
+      refreshAll();
+      toast('已从云端同步 ' + ((r.added || 0) + (r.updated || 0)) + ' 条更新');
+    }
+    return cloudPush(true);
+  }).catch(function(){/* 静默失败，不影响本地使用 */})
+   .then(function(){ cloudBusy = false; });
+}
+
+/* =========================================================
    8. 初始化（固定顺序：加载数据 → 建选项 → 刷新）
    ========================================================= */
 function initCodeOptions(){
@@ -2906,6 +3211,8 @@ function init(){
   bindEvents();
   refreshAll();
   setSyncOk();
+  renderCloudPanel();
+  cloudAutoPull();
   initIosTip();
   registerSW();
 }
