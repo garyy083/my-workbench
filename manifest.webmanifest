@@ -1,0 +1,21 @@
+{
+  "name": "学科建设科 AI 工作台",
+  "short_name": "学科建设台",
+  "description": "学科建设、双一流建设与综合事务的台账管理、进度跟踪、数据看板与材料起草",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#f5f7fa",
+  "theme_color": "#142c52",
+  "categories": ["productivity", "business"],
+  "icons": [
+    { "src": "icon-180.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
